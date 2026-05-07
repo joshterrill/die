@@ -1,0 +1,25 @@
+[package]
+name = "die"
+description = "a fast TUI disk inventory tool written in rust"
+authors = ["Josh Terrill <josh@hacked.codes>"]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/joshterrill/die"
+readme = "./README.md"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+ignore = "0.4"
+ratatui = "0.29"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
