@@ -11,6 +11,7 @@ permissions:
 env:
   BIN_NAME: die
   CARGO_TERM_COLOR: always
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   create-release:
