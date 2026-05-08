@@ -154,10 +154,47 @@ impl DeletePlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmChoice {
+    Cancel,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteConfirmation {
+    plan: DeletePlan,
+    choice: ConfirmChoice,
+}
+
+impl DeleteConfirmation {
+    fn new(plan: DeletePlan) -> Self {
+        Self {
+            plan,
+            choice: ConfirmChoice::Cancel,
+        }
+    }
+
+    fn choose_cancel(&mut self) {
+        self.choice = ConfirmChoice::Cancel;
+    }
+
+    fn choose_delete(&mut self) {
+        self.choice = ConfirmChoice::Delete;
+    }
+
+    fn toggle(&mut self) {
+        self.choice = match self.choice {
+            ConfirmChoice::Cancel => ConfirmChoice::Delete,
+            ConfirmChoice::Delete => ConfirmChoice::Cancel,
+        };
+    }
+}
+
 #[derive(Debug)]
 struct DeleteStats {
     removed_files: usize,
     removed_dirs: usize,
+    deleted_targets: Vec<PathBuf>,
     errors: Vec<String>,
     elapsed: Duration,
 }
@@ -174,7 +211,7 @@ struct App {
     inline_scan: Option<InlineScanStatus>,
     threads: usize,
     one_file_system: bool,
-    confirm: Option<DeletePlan>,
+    confirm: Option<DeleteConfirmation>,
     status: String,
     should_quit: bool,
 }
@@ -614,6 +651,7 @@ fn fast_delete(path: &Path, threads: usize, one_file_system: bool) -> Result<Del
         return Ok(DeleteStats {
             removed_files: 1,
             removed_dirs: 0,
+            deleted_targets: Vec::new(),
             errors: Vec::new(),
             elapsed: start.elapsed(),
         });
@@ -672,6 +710,7 @@ fn fast_delete(path: &Path, threads: usize, one_file_system: bool) -> Result<Del
     Ok(DeleteStats {
         removed_files: files.len(),
         removed_dirs: dirs.len().saturating_add(1),
+        deleted_targets: Vec::new(),
         errors,
         elapsed: start.elapsed(),
     })
@@ -685,6 +724,7 @@ fn fast_delete_targets(
     let start = Instant::now();
     let mut removed_files = 0usize;
     let mut removed_dirs = 0usize;
+    let mut deleted_targets = Vec::new();
     let mut errors = Vec::new();
 
     for target in targets {
@@ -693,9 +733,15 @@ fn fast_delete_targets(
                 removed_files = removed_files.saturating_add(stats.removed_files);
                 removed_dirs = removed_dirs.saturating_add(stats.removed_dirs);
                 errors.extend(stats.errors);
+                if path_is_gone(&target.path) {
+                    deleted_targets.push(target.path.clone());
+                }
             }
             Err(error) => {
                 errors.push(format!("{}: {error:#}", target.path.display()));
+                if path_is_gone(&target.path) {
+                    deleted_targets.push(target.path.clone());
+                }
             }
         }
     }
@@ -703,8 +749,16 @@ fn fast_delete_targets(
     DeleteStats {
         removed_files,
         removed_dirs,
+        deleted_targets,
         errors,
         elapsed: start.elapsed(),
+    }
+}
+
+fn path_is_gone(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
     }
 }
 
@@ -733,6 +787,34 @@ fn delete_status(plan: &DeletePlan) -> String {
     }
 
     format!("Deleting {} selected paths...", plan.targets.len())
+}
+
+fn delete_result_status(stats: &DeleteStats, updated_roots: usize) -> String {
+    let base = format!(
+        "Deleted {} files and {} directories in {}.",
+        stats.removed_files,
+        stats.removed_dirs,
+        format_duration(stats.elapsed)
+    );
+    let view = if updated_roots == 0 {
+        "No confirmed target was removed from the view."
+    } else {
+        "View updated."
+    };
+
+    if stats.errors.is_empty() {
+        return format!("{base} {view}");
+    }
+
+    let error_word = if stats.errors.len() == 1 {
+        "error"
+    } else {
+        "errors"
+    };
+    format!(
+        "{base} {} {error_word}; {view} Press r to rescan if needed.",
+        stats.errors.len()
+    )
 }
 
 fn collect_delete_entries(
@@ -940,38 +1022,10 @@ fn run_tui(
                     app.status = delete_status(&plan);
                     tui.terminal.draw(|frame| draw(frame, &mut app))?;
 
-                    let current_path = app.inventory.nodes[app.current].path.clone();
                     let stats =
                         fast_delete_targets(&plan.targets, app.threads, app.one_file_system);
-                    app.status = format!(
-                        "Deleted {} files and {} directories in {}. {}",
-                        stats.removed_files,
-                        stats.removed_dirs,
-                        format_duration(stats.elapsed),
-                        if stats.errors.is_empty() {
-                            "Rescanning..."
-                        } else {
-                            "Some paths failed; rescanning..."
-                        }
-                    );
-                    tui.terminal.draw(|frame| draw(frame, &mut app))?;
-
-                    match scan_with_progress_screen(
-                        tui,
-                        app.inventory.root.clone(),
-                        app.threads,
-                        app.one_file_system,
-                    ) {
-                        Ok(Some(inventory)) => {
-                            app.replace_inventory(inventory, &current_path);
-                        }
-                        Ok(None) => {
-                            app.should_quit = true;
-                        }
-                        Err(error) => {
-                            app.status = format!("Rescan after delete failed: {error:#}");
-                        }
-                    }
+                    let updated_roots = app.remove_deleted_targets(&stats.deleted_targets);
+                    app.status = delete_result_status(&stats, updated_roots);
                 }
             }
         }
@@ -1201,7 +1255,7 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(plan) = self.delete_plan() {
-                    self.confirm = Some(plan);
+                    self.confirm = Some(DeleteConfirmation::new(plan));
                 }
                 AppCommand::None
             }
@@ -1251,25 +1305,50 @@ impl App {
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> AppCommand {
         match key.code {
-            KeyCode::Char('y') if key.modifiers.is_empty() => {
-                if let Some(target) = self.confirm.take() {
-                    AppCommand::Delete(target)
-                } else {
-                    AppCommand::None
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(confirm) = &mut self.confirm {
+                    confirm.choose_cancel();
                 }
+                AppCommand::None
             }
-            KeyCode::Enter => {
-                if let Some(target) = self.confirm.take() {
-                    AppCommand::Delete(target)
-                } else {
-                    AppCommand::None
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(confirm) = &mut self.confirm {
+                    confirm.choose_delete();
                 }
+                AppCommand::None
             }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(confirm) = &mut self.confirm {
+                    confirm.toggle();
+                }
+                AppCommand::None
+            }
+            KeyCode::Enter => self.activate_confirmation(),
+            KeyCode::Char('y') if key.modifiers.is_empty() => self.confirm_delete(),
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('x') => {
                 self.confirm = None;
                 AppCommand::None
             }
             _ => AppCommand::None,
+        }
+    }
+
+    fn activate_confirmation(&mut self) -> AppCommand {
+        let Some(confirm) = self.confirm.take() else {
+            return AppCommand::None;
+        };
+
+        match confirm.choice {
+            ConfirmChoice::Cancel => AppCommand::None,
+            ConfirmChoice::Delete => AppCommand::Delete(confirm.plan),
+        }
+    }
+
+    fn confirm_delete(&mut self) -> AppCommand {
+        if let Some(confirm) = self.confirm.take() {
+            AppCommand::Delete(confirm.plan)
+        } else {
+            AppCommand::None
         }
     }
 
@@ -1508,6 +1587,102 @@ impl App {
 
         DeletePlan::from_targets(self.marked_targets())
     }
+
+    fn remove_deleted_targets(&mut self, deleted_paths: &[PathBuf]) -> usize {
+        let mut target_ids = deleted_paths
+            .iter()
+            .filter_map(|path| self.inventory.path_index.get(path).copied())
+            .collect::<Vec<_>>();
+        target_ids.sort_unstable_by_key(|node_id| path_depth(&self.inventory.nodes[*node_id].path));
+
+        let mut removed_roots = 0usize;
+        for node_id in target_ids {
+            if self.remove_node_subtree(node_id) {
+                removed_roots = removed_roots.saturating_add(1);
+            }
+        }
+
+        self.marked = self
+            .marked
+            .iter()
+            .copied()
+            .filter(|node_id| self.node_is_live(*node_id))
+            .collect();
+        self.history = self
+            .history
+            .iter()
+            .copied()
+            .filter(|state| self.node_is_live(state.current))
+            .collect();
+        if !self.node_is_live(self.current) {
+            self.current = 0;
+            self.history.clear();
+        }
+        self.clamp_selection();
+
+        removed_roots
+    }
+
+    fn remove_node_subtree(&mut self, node_id: usize) -> bool {
+        if !self.node_is_live(node_id) {
+            return false;
+        }
+
+        let removed_size = self.inventory.nodes[node_id].total_size;
+        let removed_entries = self.inventory.nodes[node_id]
+            .subtree_entries
+            .saturating_add(1);
+        let parent = self.inventory.nodes[node_id].parent;
+        if let Some(parent_id) = parent {
+            self.inventory.nodes[parent_id]
+                .children
+                .retain(|child| *child != node_id);
+        }
+
+        let mut ancestor = parent;
+        while let Some(ancestor_id) = ancestor {
+            self.inventory.nodes[ancestor_id].total_size = self.inventory.nodes[ancestor_id]
+                .total_size
+                .saturating_sub(removed_size);
+            self.inventory.nodes[ancestor_id].subtree_entries = self.inventory.nodes[ancestor_id]
+                .subtree_entries
+                .saturating_sub(removed_entries);
+            ancestor = self.inventory.nodes[ancestor_id].parent;
+        }
+
+        let subtree = self.subtree_node_ids(node_id);
+        for removed_id in subtree {
+            let removed_path = self.inventory.nodes[removed_id].path.clone();
+            self.inventory.path_index.remove(&removed_path);
+            self.inventory.nodes[removed_id].parent = None;
+            self.inventory.nodes[removed_id].children.clear();
+        }
+        self.inventory.scanned_entries = self
+            .inventory
+            .scanned_entries
+            .saturating_sub(removed_entries);
+
+        true
+    }
+
+    fn subtree_node_ids(&self, root: usize) -> Vec<usize> {
+        let mut subtree = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
+            subtree.push(node_id);
+            stack.extend(self.inventory.nodes[node_id].children.iter().copied());
+        }
+        subtree
+    }
+
+    fn node_is_live(&self, node_id: usize) -> bool {
+        self.inventory
+            .nodes
+            .get(node_id)
+            .and_then(|node| self.inventory.path_index.get(&node.path))
+            .copied()
+            == Some(node_id)
+    }
 }
 
 struct Tui {
@@ -1574,8 +1749,8 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_footer(frame, chunks[2], app);
     }
 
-    if let Some(plan) = &app.confirm {
-        draw_confirm(frame, area, plan);
+    if let Some(confirm) = &app.confirm {
+        draw_confirm(frame, area, confirm);
     }
 }
 
@@ -1798,56 +1973,94 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_confirm(frame: &mut Frame<'_>, area: Rect, plan: &DeletePlan) {
-    let modal = centered_rect(72, 38, area);
+fn draw_confirm(frame: &mut Frame<'_>, area: Rect, confirm: &DeleteConfirmation) {
+    let modal = centered_fixed_rect(72, confirm_modal_height(&confirm.plan), area);
     frame.render_widget(Clear, modal);
 
-    let text = if plan.targets.len() == 1 {
-        confirm_text_for_one(&plan.targets[0], plan.total_size)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(Span::styled(
+            " Confirm Delete ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    frame.render_widget(block, modal);
+
+    let inner = inset_rect(modal, 2, 1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .split(inner);
+
+    let text = if confirm.plan.targets.len() == 1 {
+        confirm_text_for_one(&confirm.plan.targets[0], confirm.plan.total_size)
     } else {
-        confirm_text_for_many(plan)
+        confirm_text_for_many(&confirm.plan)
     };
 
     let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL))
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, modal);
+    frame.render_widget(paragraph, chunks[0]);
+
+    let buttons = Paragraph::new(confirm_button_line(confirm))
+        .alignment(Alignment::Right)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(buttons, chunks[1]);
 }
 
 fn confirm_text_for_one(target: &DeleteTarget, total_size: u64) -> Vec<Line<'static>> {
-    let warning = if target.kind == NodeKind::Directory {
-        "This recursively deletes the selected directory."
+    let title = if target.kind == NodeKind::Directory {
+        "Delete this directory?"
     } else {
-        "This deletes the selected file."
+        "Delete this file?"
+    };
+    let warning = if target.kind == NodeKind::Directory {
+        "The directory and its contents will be removed."
+    } else {
+        "The selected file will be removed."
     };
 
     vec![
         Line::from(Span::styled(
-            "Confirm Delete",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(target.display_name.clone()),
-        Line::from(target.path.display().to_string()),
-        Line::from(format!("Size: {}", format_bytes(total_size))),
+        Line::from(Span::styled(
+            target.display_name.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            target.path.display().to_string(),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            format!("Size: {}", format_bytes(total_size)),
+            Style::default().fg(Color::Yellow),
+        )),
         Line::from(""),
         Line::from(warning),
-        Line::from("Press y to delete, Esc to cancel."),
     ]
 }
 
 fn confirm_text_for_many(plan: &DeletePlan) -> Vec<Line<'static>> {
     let mut text = vec![
         Line::from(Span::styled(
-            "Confirm Delete",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            format!("Delete {} selected paths?", plan.targets.len()),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Total size: {}", format_bytes(plan.total_size)),
+            Style::default().fg(Color::Yellow),
         )),
         Line::from(""),
-        Line::from(format!("{} selected paths", plan.targets.len())),
-        Line::from(format!("Total size: {}", format_bytes(plan.total_size))),
-        Line::from(""),
         Line::from("This recursively deletes selected directories and files."),
+        Line::from(""),
     ];
 
     for target in plan.targets.iter().take(4) {
@@ -1860,29 +2073,47 @@ fn confirm_text_for_many(plan: &DeletePlan) -> Vec<Line<'static>> {
         )));
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from("Press y to delete, Esc to cancel."));
     text
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
+fn confirm_modal_height(plan: &DeletePlan) -> u16 {
+    if plan.targets.len() == 1 {
+        return 14;
+    }
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
+    13u16
+        .saturating_add(plan.targets.len().min(4) as u16)
+        .saturating_add(u16::from(plan.targets.len() > 4))
+}
+
+fn confirm_button_line(confirm: &DeleteConfirmation) -> Line<'static> {
+    Line::from(vec![
+        confirm_button("Cancel", confirm.choice == ConfirmChoice::Cancel, false),
+        Span::raw("  "),
+        confirm_button("Yes", confirm.choice == ConfirmChoice::Delete, true),
+    ])
+}
+
+fn confirm_button(label: &'static str, selected: bool, danger: bool) -> Span<'static> {
+    let style = if selected && danger {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if danger {
+        Style::default()
+            .fg(Color::LightRed)
+            .bg(Color::Rgb(44, 24, 24))
+    } else {
+        Style::default().fg(Color::Gray).bg(Color::Rgb(32, 34, 38))
+    };
+
+    Span::styled(format!("  {label}  "), style)
 }
 
 fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -1893,6 +2124,15 @@ fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
+    }
+}
+
+fn inset_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
+    Rect {
+        x: area.x.saturating_add(horizontal),
+        y: area.y.saturating_add(vertical),
+        width: area.width.saturating_sub(horizontal.saturating_mul(2)),
+        height: area.height.saturating_sub(vertical.saturating_mul(2)),
     }
 }
 
@@ -2203,6 +2443,89 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn delete_confirmation_enter_defaults_to_cancel() {
+        let mut app = selection_app();
+        select_first_child(&mut app);
+
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.confirm.as_ref().map(|confirm| confirm.choice),
+            Some(ConfirmChoice::Cancel)
+        );
+
+        let command = app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(command, AppCommand::None));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn delete_confirmation_can_select_yes_with_arrow_and_enter() {
+        let mut app = selection_app();
+        select_first_child(&mut app);
+
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Right));
+        let command = app.handle_key(key(KeyCode::Enter));
+
+        let AppCommand::Delete(plan) = command else {
+            panic!("expected delete command");
+        };
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].display_name, "a");
+    }
+
+    #[test]
+    fn removing_deleted_target_updates_inventory_without_rescan() {
+        let root = PathBuf::from("/tmp/fdi-delete-update-root");
+        let deleted_dir = root.join("a");
+        let kept_file = root.join("b");
+        let records = vec![
+            EntryRecord {
+                path: root.clone(),
+                depth: path_depth(&root),
+                kind: NodeKind::Directory,
+                own_size: 10,
+            },
+            EntryRecord {
+                path: deleted_dir.clone(),
+                depth: path_depth(&deleted_dir),
+                kind: NodeKind::Directory,
+                own_size: 2,
+            },
+            EntryRecord {
+                path: deleted_dir.join("child"),
+                depth: path_depth(&deleted_dir.join("child")),
+                kind: NodeKind::File,
+                own_size: 8,
+            },
+            EntryRecord {
+                path: kept_file.clone(),
+                depth: path_depth(&kept_file),
+                kind: NodeKind::File,
+                own_size: 4,
+            },
+        ];
+        let mut app = App::new(build_inventory(root.clone(), records), 2, false);
+        app.inventory.scanned_entries = app.inventory.nodes.len();
+
+        let removed = app.remove_deleted_targets(&[deleted_dir.clone()]);
+
+        assert_eq!(removed, 1);
+        assert!(!app.inventory.path_index.contains_key(&deleted_dir));
+        assert!(
+            !app.inventory
+                .path_index
+                .contains_key(&deleted_dir.join("child"))
+        );
+        assert!(app.inventory.path_index.contains_key(&kept_file));
+        assert_eq!(app.inventory.nodes[0].children.len(), 1);
+        assert_eq!(app.inventory.nodes[0].total_size, 14);
+        assert_eq!(app.inventory.nodes[0].subtree_entries, 1);
+        assert_eq!(app.inventory.scanned_entries, 2);
     }
 
     #[test]
