@@ -13,6 +13,7 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 crossterm = "0.29"
+foldhash = "0.1"
 ignore = "0.4"
 ratatui = "0.29"
 rayon = "1.10"

@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{self, Stdout},
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -19,6 +20,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use foldhash::fast::RandomState as FastHash;
 use ignore::{WalkBuilder, WalkState};
 use ratatui::{
     Frame, Terminal,
@@ -95,15 +97,14 @@ impl NodeKind {
 
 #[derive(Debug, Clone)]
 struct EntryRecord {
-    path: PathBuf,
-    depth: usize,
+    path: Arc<Path>,
     kind: NodeKind,
     own_size: u64,
 }
 
 #[derive(Debug, Clone)]
 struct Node {
-    path: PathBuf,
+    path: Arc<Path>,
     name: String,
     parent: Option<usize>,
     children: Vec<usize>,
@@ -117,11 +118,13 @@ struct Node {
 struct Inventory {
     root: PathBuf,
     nodes: Vec<Node>,
-    path_index: HashMap<PathBuf, usize>,
+    path_index: PathIndex,
     scanned_entries: usize,
     errors: Vec<String>,
     elapsed: Duration,
 }
+
+type PathIndex = HashMap<Arc<Path>, usize, FastHash>;
 
 #[derive(Debug, Clone)]
 struct DeleteTarget {
@@ -266,7 +269,6 @@ impl ReusableSubtree {
             .iter()
             .map(|node| EntryRecord {
                 path: node.path.clone(),
-                depth: path_depth(&node.path),
                 kind: node.kind,
                 own_size: node.own_size,
             })
@@ -318,7 +320,7 @@ fn scan_inventory_with_reuse(
     let start = Instant::now();
     let root_metadata = fs::symlink_metadata(&root)
         .with_context(|| format!("failed to read metadata for {}", root.display()))?;
-    let root_record = record_from_metadata(root.clone(), root_metadata);
+    let root_record = record_from_metadata(Arc::from(root.as_path()), root_metadata);
 
     let mut records = Vec::with_capacity(32_768);
     records.push(root_record);
@@ -356,6 +358,7 @@ fn scan_inventory_with_reuse(
                 let tx = tx.clone();
                 let root = walker_root.clone();
                 let skip_path = skip_path.clone();
+                let mut batch = RecordBatch::new(tx.clone());
                 Box::new(move |result| {
                     match result {
                         Ok(entry) => {
@@ -366,22 +369,16 @@ fn scan_inventory_with_reuse(
                             if path != root.as_path() {
                                 match fs::symlink_metadata(path) {
                                     Ok(metadata) => {
-                                        let _ = tx.send(ScanMessage::Record(record_from_metadata(
-                                            path.to_path_buf(),
-                                            metadata,
-                                        )));
+                                        batch.push(record_from_metadata(Arc::from(path), metadata));
                                     }
                                     Err(error) => {
-                                        let _ = tx.send(ScanMessage::Error(format!(
-                                            "{}: {error}",
-                                            path.display()
-                                        )));
+                                        batch.error(format!("{}: {error}", path.display()));
                                     }
                                 }
                             }
                         }
                         Err(error) => {
-                            let _ = tx.send(ScanMessage::Error(error.to_string()));
+                            batch.error(error.to_string());
                         }
                     }
                     WalkState::Continue
@@ -389,17 +386,19 @@ fn scan_inventory_with_reuse(
             });
         });
 
-        let mut messages_since_report = 0usize;
+        let mut entries_since_report = 0usize;
         let mut last_reported_errors = errors.len();
         for message in rx {
             match message {
-                ScanMessage::Record(record) => records.push(record),
+                ScanMessage::Batch(batch) => {
+                    entries_since_report = entries_since_report.saturating_add(batch.len());
+                    records.extend(batch);
+                }
                 ScanMessage::Error(error) => errors.push(error),
             }
-            messages_since_report = messages_since_report.saturating_add(1);
-            if messages_since_report >= 256 || errors.len() != last_reported_errors {
+            if entries_since_report >= 256 || errors.len() != last_reported_errors {
                 report_scan_progress(&progress_tx, records.len(), errors.len());
-                messages_since_report = 0;
+                entries_since_report = 0;
                 last_reported_errors = errors.len();
             }
         }
@@ -449,11 +448,57 @@ fn scan_inventory(path: PathBuf, threads: usize, one_file_system: bool) -> Resul
 
 #[derive(Debug)]
 enum ScanMessage {
-    Record(EntryRecord),
+    Batch(Vec<EntryRecord>),
     Error(String),
 }
 
-fn record_from_metadata(path: PathBuf, metadata: fs::Metadata) -> EntryRecord {
+/// Per-walker-thread buffer that batches records before sending them over the
+/// channel. Sending one message per entry is a measurable cost on large scans;
+/// batching cuts channel traffic by orders of magnitude. `Drop` flushes whatever
+/// is left when the walker finishes.
+struct RecordBatch {
+    tx: channel::Sender<ScanMessage>,
+    records: Vec<EntryRecord>,
+}
+
+const RECORD_BATCH_SIZE: usize = 1024;
+
+impl RecordBatch {
+    fn new(tx: channel::Sender<ScanMessage>) -> Self {
+        Self {
+            tx,
+            records: Vec::with_capacity(RECORD_BATCH_SIZE),
+        }
+    }
+
+    fn push(&mut self, record: EntryRecord) {
+        self.records.push(record);
+        if self.records.len() >= RECORD_BATCH_SIZE {
+            self.flush();
+        }
+    }
+
+    fn error(&self, error: String) {
+        let _ = self.tx.send(ScanMessage::Error(error));
+    }
+
+    fn flush(&mut self) {
+        if self.records.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.records);
+        self.records = Vec::with_capacity(RECORD_BATCH_SIZE);
+        let _ = self.tx.send(ScanMessage::Batch(batch));
+    }
+}
+
+impl Drop for RecordBatch {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+fn record_from_metadata(path: Arc<Path>, metadata: fs::Metadata) -> EntryRecord {
     let file_type = metadata.file_type();
     let kind = if file_type.is_dir() {
         NodeKind::Directory
@@ -465,11 +510,9 @@ fn record_from_metadata(path: PathBuf, metadata: fs::Metadata) -> EntryRecord {
         NodeKind::Other
     };
     let own_size = disk_size(&metadata);
-    let depth = path_depth(&path);
 
     EntryRecord {
         path,
-        depth,
         kind,
         own_size,
     }
@@ -485,24 +528,25 @@ fn disk_size(metadata: &fs::Metadata) -> u64 {
     metadata.len()
 }
 
-fn build_inventory(root: PathBuf, mut records: Vec<EntryRecord>) -> Inventory {
-    records.sort_unstable_by(|left, right| {
-        left.depth
-            .cmp(&right.depth)
-            .then_with(|| left.path.cmp(&right.path))
-    });
+fn build_inventory(root: PathBuf, records: Vec<EntryRecord>) -> Inventory {
+    // The root record is always inserted first (before any reused records), and the
+    // walker never emits a second record for it, so it is always at index 0.
+    let mut records = records.into_iter();
+    let capacity = records.len() + 1;
+    let root_record = records
+        .next()
+        .expect("root record is inserted before build");
 
     let root_name = root
         .file_name()
         .map(display_os_str)
         .unwrap_or_else(|| root.display().to_string());
-    let root_record = records
-        .iter()
-        .find(|record| record.path == root)
-        .expect("root record is inserted before build");
 
-    let mut nodes = vec![Node {
-        path: root.clone(),
+    let mut nodes = Vec::with_capacity(capacity);
+    let mut path_index = PathIndex::with_capacity_and_hasher(capacity, FastHash::default());
+    let root_path: Arc<Path> = Arc::from(root.as_path());
+    nodes.push(Node {
+        path: root_path.clone(),
         name: root_name,
         parent: None,
         children: Vec::new(),
@@ -510,68 +554,68 @@ fn build_inventory(root: PathBuf, mut records: Vec<EntryRecord>) -> Inventory {
         own_size: root_record.own_size,
         total_size: root_record.own_size,
         subtree_entries: 0,
-    }];
-    let mut path_index = HashMap::with_capacity(records.len());
-    path_index.insert(root.clone(), 0);
+    });
+    path_index.insert(root_path, 0);
 
+    // Records arrive in walker order, not sorted, but `ensure_directory_node` creates
+    // any missing ancestors before their descendants. That preserves the invariant that
+    // a parent's node id is always lower than its children's ids, which the roll-up pass
+    // below relies on.
     for record in records {
-        if record.path == root {
-            continue;
-        }
-        let parent_path = record
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.clone());
-        let parent = ensure_directory_node(&parent_path, &root, &mut nodes, &mut path_index);
-        if let Some(&id) = path_index.get(&record.path) {
+        let parent_path = record.path.parent().unwrap_or(&root);
+        let parent = ensure_directory_node(parent_path, &mut nodes, &mut path_index);
+        // Only directories can already exist here: they may have been created as an
+        // ancestor placeholder while inserting a descendant that the walker yielded
+        // first. Files and symlinks are always unique leaves.
+        if record.kind == NodeKind::Directory
+            && let Some(&id) = path_index.get(record.path.as_ref())
+        {
             nodes[id].kind = record.kind;
             nodes[id].own_size = record.own_size;
-        } else {
-            let id = nodes.len();
-            let name = record
-                .path
-                .file_name()
-                .map(display_os_str)
-                .unwrap_or_else(|| record.path.display().to_string());
-            nodes.push(Node {
-                path: record.path.clone(),
-                name,
-                parent: Some(parent),
-                children: Vec::new(),
-                kind: record.kind,
-                own_size: record.own_size,
-                total_size: record.own_size,
-                subtree_entries: 0,
-            });
-            path_index.insert(record.path, id);
-            nodes[parent].children.push(id);
+            continue;
         }
+
+        let id = nodes.len();
+        let name = record
+            .path
+            .file_name()
+            .map(display_os_str)
+            .unwrap_or_else(|| record.path.display().to_string());
+        path_index.insert(record.path.clone(), id);
+        nodes.push(Node {
+            path: record.path,
+            name,
+            parent: Some(parent),
+            children: Vec::new(),
+            kind: record.kind,
+            own_size: record.own_size,
+            total_size: record.own_size,
+            subtree_entries: 0,
+        });
+        nodes[parent].children.push(id);
     }
 
     for id in (0..nodes.len()).rev() {
-        let children = nodes[id].children.clone();
         let mut total_size = nodes[id].own_size;
         let mut subtree_entries = 0usize;
-        for child in children {
-            total_size = total_size.saturating_add(nodes[child].total_size);
-            subtree_entries = subtree_entries.saturating_add(1 + nodes[child].subtree_entries);
+        for child in &nodes[id].children {
+            total_size = total_size.saturating_add(nodes[*child].total_size);
+            subtree_entries = subtree_entries.saturating_add(1 + nodes[*child].subtree_entries);
         }
         nodes[id].total_size = total_size;
         nodes[id].subtree_entries = subtree_entries;
-    }
 
-    let sort_keys = nodes
-        .iter()
-        .map(|node| (node.total_size, node.name.clone()))
-        .collect::<Vec<_>>();
-    for node in &mut nodes {
-        node.children.sort_unstable_by(|left, right| {
-            sort_keys[*right]
-                .0
-                .cmp(&sort_keys[*left].0)
-                .then_with(|| sort_keys[*left].1.cmp(&sort_keys[*right].1))
-        });
+        if nodes[id].children.len() > 1 {
+            // Take the child list out so the comparator can borrow the other nodes.
+            let mut children = std::mem::take(&mut nodes[id].children);
+            children.sort_unstable_by(|left, right| {
+                nodes[*right]
+                    .total_size
+                    .cmp(&nodes[*left].total_size)
+                    .then_with(|| nodes[*left].name.cmp(&nodes[*right].name))
+            });
+            nodes[id].children = children;
+        }
     }
 
     Inventory {
@@ -584,38 +628,36 @@ fn build_inventory(root: PathBuf, mut records: Vec<EntryRecord>) -> Inventory {
     }
 }
 
-fn ensure_directory_node(
-    path: &Path,
-    root: &Path,
-    nodes: &mut Vec<Node>,
-    path_index: &mut HashMap<PathBuf, usize>,
-) -> usize {
+fn ensure_directory_node(path: &Path, nodes: &mut Vec<Node>, path_index: &mut PathIndex) -> usize {
     if let Some(&id) = path_index.get(path) {
         return id;
     }
 
-    let mut missing = Vec::new();
-    let mut current = path.to_path_buf();
-    while !path_index.contains_key(&current) {
-        missing.push(current.clone());
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => break,
-        }
-        if current == root {
+    // Collect the missing ancestor chain. Every entry is a sub-slice of `path`,
+    // so this does not allocate any path strings.
+    let mut missing: Vec<&Path> = Vec::with_capacity(2);
+    let mut current = path;
+    loop {
+        if path_index.contains_key(current) {
             break;
+        }
+        missing.push(current);
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
         }
     }
 
-    let mut parent_id = *path_index.get(&current).unwrap_or(&0);
+    let mut parent_id = path_index.get(current).copied().unwrap_or(0);
     for missing_path in missing.into_iter().rev() {
         let id = nodes.len();
         let name = missing_path
             .file_name()
             .map(display_os_str)
             .unwrap_or_else(|| missing_path.display().to_string());
+        let owned: Arc<Path> = Arc::from(missing_path);
         nodes.push(Node {
-            path: missing_path.clone(),
+            path: owned.clone(),
             name,
             parent: Some(parent_id),
             children: Vec::new(),
@@ -625,7 +667,7 @@ fn ensure_directory_node(
             subtree_entries: 0,
         });
         nodes[parent_id].children.push(id);
-        path_index.insert(missing_path, id);
+        path_index.insert(owned, id);
         parent_id = id;
     }
 
@@ -1537,7 +1579,7 @@ impl App {
     fn delete_target_for_node(&self, node_id: usize) -> Option<DeleteTarget> {
         let node = &self.inventory.nodes[node_id];
         Some(DeleteTarget {
-            path: node.path.clone(),
+            path: node.path.to_path_buf(),
             display_name: node.name.clone(),
             total_size: node.total_size,
             kind: node.kind,
@@ -1591,7 +1633,7 @@ impl App {
     fn remove_deleted_targets(&mut self, deleted_paths: &[PathBuf]) -> usize {
         let mut target_ids = deleted_paths
             .iter()
-            .filter_map(|path| self.inventory.path_index.get(path).copied())
+            .filter_map(|path| self.inventory.path_index.get(path.as_path()).copied())
             .collect::<Vec<_>>();
         target_ids.sort_unstable_by_key(|node_id| path_depth(&self.inventory.nodes[*node_id].path));
 
@@ -1679,7 +1721,7 @@ impl App {
         self.inventory
             .nodes
             .get(node_id)
-            .and_then(|node| self.inventory.path_index.get(&node.path))
+            .and_then(|node| self.inventory.path_index.get(node.path.as_ref()))
             .copied()
             == Some(node_id)
     }
@@ -2304,26 +2346,22 @@ mod tests {
         let root = PathBuf::from("/tmp/fdi-selection-root");
         let records = vec![
             EntryRecord {
-                path: root.clone(),
-                depth: path_depth(&root),
+                path: root.clone().into(),
                 kind: NodeKind::Directory,
                 own_size: 0,
             },
             EntryRecord {
-                path: root.join("a"),
-                depth: path_depth(&root.join("a")),
+                path: root.join("a").into(),
                 kind: NodeKind::File,
                 own_size: 1,
             },
             EntryRecord {
-                path: root.join("b"),
-                depth: path_depth(&root.join("b")),
+                path: root.join("b").into(),
                 kind: NodeKind::File,
                 own_size: 1,
             },
             EntryRecord {
-                path: root.join("c"),
-                depth: path_depth(&root.join("c")),
+                path: root.join("c").into(),
                 kind: NodeKind::File,
                 own_size: 1,
             },
@@ -2421,8 +2459,16 @@ mod tests {
         )
         .expect("parent scan failed");
 
-        assert!(parent_inventory.path_index.contains_key(&reused_nested));
-        assert!(parent_inventory.path_index.contains_key(&scanned_sibling));
+        assert!(
+            parent_inventory
+                .path_index
+                .contains_key(reused_nested.as_path())
+        );
+        assert!(
+            parent_inventory
+                .path_index
+                .contains_key(scanned_sibling.as_path())
+        );
     }
 
     #[test]
@@ -2485,26 +2531,22 @@ mod tests {
         let kept_file = root.join("b");
         let records = vec![
             EntryRecord {
-                path: root.clone(),
-                depth: path_depth(&root),
+                path: root.clone().into(),
                 kind: NodeKind::Directory,
                 own_size: 10,
             },
             EntryRecord {
-                path: deleted_dir.clone(),
-                depth: path_depth(&deleted_dir),
+                path: deleted_dir.clone().into(),
                 kind: NodeKind::Directory,
                 own_size: 2,
             },
             EntryRecord {
-                path: deleted_dir.join("child"),
-                depth: path_depth(&deleted_dir.join("child")),
+                path: deleted_dir.join("child").into(),
                 kind: NodeKind::File,
                 own_size: 8,
             },
             EntryRecord {
-                path: kept_file.clone(),
-                depth: path_depth(&kept_file),
+                path: kept_file.clone().into(),
                 kind: NodeKind::File,
                 own_size: 4,
             },
@@ -2515,13 +2557,13 @@ mod tests {
         let removed = app.remove_deleted_targets(&[deleted_dir.clone()]);
 
         assert_eq!(removed, 1);
-        assert!(!app.inventory.path_index.contains_key(&deleted_dir));
+        assert!(!app.inventory.path_index.contains_key(deleted_dir.as_path()));
         assert!(
             !app.inventory
                 .path_index
-                .contains_key(&deleted_dir.join("child"))
+                .contains_key(deleted_dir.join("child").as_path())
         );
-        assert!(app.inventory.path_index.contains_key(&kept_file));
+        assert!(app.inventory.path_index.contains_key(kept_file.as_path()));
         assert_eq!(app.inventory.nodes[0].children.len(), 1);
         assert_eq!(app.inventory.nodes[0].total_size, 14);
         assert_eq!(app.inventory.nodes[0].subtree_entries, 1);
@@ -2569,20 +2611,17 @@ mod tests {
         let root = PathBuf::from("/tmp/fdi-selection-root");
         let records = vec![
             EntryRecord {
-                path: root.clone(),
-                depth: path_depth(&root),
+                path: root.clone().into(),
                 kind: NodeKind::Directory,
                 own_size: 0,
             },
             EntryRecord {
-                path: root.join("a"),
-                depth: path_depth(&root.join("a")),
+                path: root.join("a").into(),
                 kind: NodeKind::File,
                 own_size: 1,
             },
             EntryRecord {
-                path: root.join("b"),
-                depth: path_depth(&root.join("b")),
+                path: root.join("b").into(),
                 kind: NodeKind::File,
                 own_size: 1,
             },
@@ -2595,20 +2634,17 @@ mod tests {
         let child = root.join("child");
         let records = vec![
             EntryRecord {
-                path: root.clone(),
-                depth: path_depth(&root),
+                path: root.clone().into(),
                 kind: NodeKind::Directory,
                 own_size: 0,
             },
             EntryRecord {
-                path: child.clone(),
-                depth: path_depth(&child),
+                path: child.clone().into(),
                 kind: NodeKind::Directory,
                 own_size: 0,
             },
             EntryRecord {
-                path: child.join("file"),
-                depth: path_depth(&child.join("file")),
+                path: child.join("file").into(),
                 kind: NodeKind::File,
                 own_size: 1,
             },
